@@ -1,5 +1,7 @@
 #####################################################################################
 library(nloptr)
+library(pracma)
+library(GenSA)
 #####Parallelize####################
 # cl <- makeCluster(4)
 ######################################README#########################################
@@ -24,22 +26,23 @@ library(nloptr)
 #thetain: Initial values of theta to search over
 #gamin: Initial values of tilting parameter, gamma to search over (must match the dimension of dimf)
 ####################ELVIS######################################################
-elvisutil <- function(Z, theta, Moment=function(U, Z, theta) (Z[,1]+U-Z[,2]*theta[1])*Z[,2], 
-	rep, thetanuisin, gamin){
+elvisutil <- function(Z, thetain, gamin, rep, Moment=function(U, Z, theta) (Z[,1]+U-Z[,2]*theta[1])*Z[,2],
+	guess_un=function(Z, theta, gam) matrix(runif(n)), jump_un=function(U, Z, theta) matrix(runif(n)), 
+	rho=function(U, Z, theta) matrix(rep(1, n))){
 #######Metropolis Hastings Algorithm############################################
- 	avg_mom <- function(theta, nuisgam){ 
- 		if (getnbnuis()==0 & is.null(thetanuisin)){
- 			gam <- nuisgam
- 		} else {
- 			thetanuis <- nuisgam[1:length(thetanuisin)]
- 			gam <- nuisgam[length(thetanuisin)+1:dimf]
- 		}
+ 	avg_mom <- function(thetagam){ 
+ 		theta <- thetagam[1:length(thetain)]
+ 		gam <- thetagam[(length(thetain)+1):(length(thetain)+dimf)]
  		r <- -rep[1]+1
+ 		#Store average as a for accepted draws
  		avg <- matrix(0, nrow=n, ncol=dimf)
+ 		#Store accepted values of the vector of unobservables
+ 		#This is useful for MCMC diagnostics as a function of a sequence of
+ 		#parameter values for theta and gamma (esp. the optimal values)
+ 		unmat <- matrix(0, nrow=n, ncol=rep[2])
  		#Initial Guess for Unobservables
  		un <- guess_un(Z, theta, gam)
 		for (i in r:rep[2]){
-			set.seed(123456+i)
 			#Proposal distribution 
 			try_un <- jump_un(un, Z, theta)
 			#Acceptance Probability
@@ -49,29 +52,43 @@ elvisutil <- function(Z, theta, Moment=function(U, Z, theta) (Z[,1]+U-Z[,2]*thet
 			aindex <- which(runif(n) < try_dens)
 			#Update unobservables that satisfy acceptance rule
 			un[aindex] <- try_un[aindex]
-			}
 			if (i>0){
+				unmat[,i] <- un
 				avg <- avg+Moment(un, Z, theta)/rep[2]
 			}
- 		avg[is.na(avg)] <- 0
+		}
+		avg[is.na(avg)] <- 0
  		return(avg)
  	}
- ############Define GMM Objective Function#############################
- 	gmm_objective <- function(theta, nuisgam){
- 		avg <- avg_mom(theta, nuisgam)
- 		gm <- colMeans(avg)
- 		V <- (t(avg)%*%avg/n-gm%*%t(gm))
- 		return(-t(gm)%*%pinv(V)%*%gm)
+
+#############Define MM Objective Function##############################
+#Searching for gamma is convex by construction so we use numerical methods
+#Analytical jacobian for newton-raphson can be constructed
+ 	GMM_objective <- function(thetagam){
+ 		mom <- avg_mom(thetagam)
+ 		obj <- nrow(mom)*colMeans(mom)%*%inv(var(mom))%*%as.matrix(colMeans(mom))
+ 		return(-obj)
  	}
- #######Grid Search over theta (For GMM objective)
- 		gamp <- sbplx(x0=c(thetanuisin, gamin), fn=function(z) gmm_objective(theta, z), control=list(ftol_abs=1e-3))$value
- 		return(gamp)
+ 	GMM_profile <- function(theta){
+ 		#Subplex method
+ 		gam <- bobyqa(x0=gamin, fn=function(z) GMM_objective(c(theta, z)))
+ 		gamsoln <- gam$value
+ 		return(gamsoln)
+ 		#MM method
+ 		# gamsol <- newtonsys(Ffun=function(z) GMM_objective(c(theta, z)), x0=gamin, maxiter=500)$zero
+ 		# return(GMM_objective(c(theta, gamsol)))
+ 	}
+ #Optimize over theta using GMM
+ results <- bobyqa(x0=thetain, fn=GMM_profile, lower=thetao-1, upper=thetao+1, control=list(maxeval=100))
+ print(results)
+ thetasoln <- results$par
+ return(thetasoln)
 }
 ######################################MCMC Rules ##################################
 #Burn in and integration replications
-rep <- c(5,10)
+rep <- c(50,500)
 #Number of MC replications
-nreps <- 2
+nreps <- 1
 #Initial Guess for the unobservable
 guess_un <- function(Z, theta, gam){
 	return(matrix(runif(n)))
@@ -84,11 +101,8 @@ jump_un <- function(U, Z, theta){
 rho <- function(U, Z, theta){
 	return(matrix(rep(1, n)))
 }
-#Indicate the number of nuisance paramters (to be profiled out)
-getnbnuis <- function(){
-	return(1)
-}
 ###########################################DGP#####################################
+#Interval Valued Data Example
 ###########################Moment Function########################
 Moment <- function(U, Z, theta){
 	M <- cbind(Z[,1]+U-Z[,2]*theta[1], (Z[,1]+U-Z[,2]*theta[1])*Z[,2], 
@@ -99,16 +113,13 @@ Moment <- function(U, Z, theta){
 n <- 250
 res <- 1
 #True value of Theta[1]
-thetao <- 1
-#True value of nuisance parameter Theta[2]
-thetanuiso <- 0.2
-#Grid for Theta search
-theta <- seq(0, 2, by=0.05)
+thetao <- c(1, 0.2)
 #Matrix to store objective function values over grid
-soln <- array(0, dim=c(length(theta), nreps))
+soln <- array(0, dim=c(nreps, length(thetao)))
 #Time entire experiment
 overall.start.time <- Sys.time()
 for (j in 1:nreps){
+	print(j)
 	loop.time <- proc.time()
 	set.seed(123456+j)
 	x <- rnorm(n, mean=0, sd=1)
@@ -116,19 +127,15 @@ for (j in 1:nreps){
 	yt <- thetao[1]*x+dy
 	y <- res*floor(yt/res)
 	Z <- cbind(y, x)
-	dimf <- dim(Moment(U=runif(n), Z=Z, theta=c(thetao, thetanuiso)))[2]
-	for (t in 1:length(theta)){
-		soln[t,j] <- elvisutil(Z=Z, theta=theta[t], Moment=Moment, rep=rep, thetanuisin=0.2, gamin=rep(0, times=dimf))
-	}
+	dimf <- dim(Moment(U=runif(n), Z=Z, theta=thetao))[2]
+	soln[j,] <- elvisutil(Z=Z, thetain=thetao, gamin=rep(0, times=dimf), rep=rep, Moment=Moment, guess_un=guess_un,
+		jump_un=jump_un, rho=rho)
 	print(proc.time()-loop.time)
-	if (j==nreps){
-		plot(theta, soln[,j], type="l", xlab=expression(theta), ylab=~hat(L[n])(theta), main="Objective Function for Interval-Valued Data Regression")
-		abline(v=thetao, lty=3)
-	}
 }
-par <- theta[apply(soln, 2, which.max)]
-mean.theta <- mean(par)
-se.theta <- sd(par)
+mean.theta <- colMeans(soln)
+se.theta <- apply(soln, 2, sd)
+print(mean.theta)
+print(se.theta)
 print(Sys.time()-overall.start.time)
 
 
